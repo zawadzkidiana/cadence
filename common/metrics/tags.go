@@ -71,6 +71,8 @@ const (
 	mode                      = "mode"
 	isRetry                   = "is_retry"
 	queryConsistencyLevel     = "query_consistency_level"
+	budgetManagerName         = "budget_manager_name"
+	datastore                 = "datastore"
 
 	// limiter-side tags
 	globalRatelimitKey            = "global_ratelimit_key"
@@ -347,6 +349,19 @@ func NamespaceTag(namespace string) Tag {
 	return metricWithUnknown("namespace", namespace)
 }
 
+func NamespaceTypeTag(namespaceType string) Tag {
+	return metricWithUnknown("namespace_type", namespaceType)
+}
+
+func HandoverTypeTag(handoverType string) Tag {
+	return metricWithUnknown("handover_type", handoverType)
+}
+
+// DatastoreTag returns a new datastore tag.
+func DatastoreTag(value string) Tag {
+	return metricWithUnknown(datastore, value)
+}
+
 func TaskCategoryTag(category string) Tag {
 	return metricWithUnknown("task_category", category)
 }
@@ -374,4 +389,9 @@ func ActiveClusterSelectionStrategyTag(strategy string) Tag {
 // QueryConsistencyLevelTag returns a new query consistency level tag.
 func QueryConsistencyLevelTag(level string) Tag {
 	return metricWithUnknown(queryConsistencyLevel, level)
+}
+
+// BudgetManagerNameTag returns a new budget manager name tag.
+func BudgetManagerNameTag(name string) Tag {
+	return metricWithUnknown(budgetManagerName, name)
 }

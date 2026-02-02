@@ -63,6 +63,7 @@ import (
 	"github.com/uber/cadence/common/quotas/permember"
 	"github.com/uber/cadence/common/rpc"
 	"github.com/uber/cadence/common/service"
+	"github.com/uber/cadence/service/sharddistributor/client/executorclient"
 )
 
 func NewResourceFactory() ResourceFactory {
@@ -111,16 +112,18 @@ type Impl struct {
 
 	// internal services clients
 
-	sdkClient                 workflowserviceclient.Interface
-	frontendRawClient         frontend.Client
-	frontendClient            frontend.Client
-	matchingRawClient         matching.Client
-	matchingClient            matching.Client
-	historyRawClient          history.Client
-	historyClient             history.Client
-	shardDistributorRawClient sharddistributor.Client
-	shardDistributorClient    sharddistributor.Client
-	clientBean                client.Bean
+	sdkClient                         workflowserviceclient.Interface
+	frontendRawClient                 frontend.Client
+	frontendClient                    frontend.Client
+	matchingRawClient                 matching.Client
+	matchingClient                    matching.Client
+	historyRawClient                  history.Client
+	historyClient                     history.Client
+	shardDistributorRawClient         sharddistributor.Client
+	shardDistributorClient            sharddistributor.Client
+	shardDistributorExecutorRawClient executorclient.Client
+	shardDistributorExecutorClient    executorclient.Client
+	clientBean                        client.Bean
 
 	// persistence clients
 	persistenceBean persistenceClient.Bean
@@ -209,6 +212,7 @@ func New(
 		params.MetricsClient,
 		logger,
 		persistence.NewDynamicConfiguration(dynamicCollection),
+		params.HostName,
 	), &persistenceClient.Params{
 		PersistenceConfig: params.PersistenceConfig,
 		MetricsClient:     params.MetricsClient,
@@ -278,6 +282,18 @@ func New(
 	} else {
 		shardDistributorClient = retryable.NewShardDistributorClient(
 			shardDistributorRawClient,
+			common.CreateShardDistributorServiceRetryPolicy(),
+			serviceConfig.IsErrorRetryableFunction,
+		)
+	}
+
+	shardDistributorExecutorRawClient := clientBean.GetShardDistributorExecutorClient()
+	var shardDistributorExecutorClient executorclient.Client
+	if shardDistributorExecutorRawClient == nil {
+		shardDistributorExecutorClient = nil
+	} else {
+		shardDistributorExecutorClient = retryable.NewShardDistributorExecutorClient(
+			shardDistributorExecutorRawClient,
 			common.CreateShardDistributorServiceRetryPolicy(),
 			serviceConfig.IsErrorRetryableFunction,
 		)
@@ -366,16 +382,18 @@ func New(
 
 		// internal services clients
 
-		sdkClient:                 params.PublicClient,
-		frontendRawClient:         frontendRawClient,
-		frontendClient:            frontendClient,
-		matchingRawClient:         matchingRawClient,
-		matchingClient:            matchingClient,
-		historyRawClient:          historyRawClient,
-		historyClient:             historyClient,
-		shardDistributorRawClient: shardDistributorRawClient,
-		shardDistributorClient:    shardDistributorClient,
-		clientBean:                clientBean,
+		sdkClient:                         params.PublicClient,
+		frontendRawClient:                 frontendRawClient,
+		frontendClient:                    frontendClient,
+		matchingRawClient:                 matchingRawClient,
+		matchingClient:                    matchingClient,
+		historyRawClient:                  historyRawClient,
+		historyClient:                     historyClient,
+		shardDistributorRawClient:         shardDistributorRawClient,
+		shardDistributorClient:            shardDistributorClient,
+		shardDistributorExecutorRawClient: shardDistributorExecutorRawClient,
+		shardDistributorExecutorClient:    shardDistributorExecutorClient,
+		clientBean:                        clientBean,
 
 		// persistence clients
 		persistenceBean: persistenceBean,
@@ -594,6 +612,16 @@ func (h *Impl) GetHistoryClient() history.Client {
 	return h.historyClient
 }
 
+// GetShardDistributorExecutorRawClient return client for sharddistributor executor
+func (h *Impl) GetShardDistributorExecutorRawClient() executorclient.Client {
+	return h.shardDistributorExecutorRawClient
+}
+
+// GetShardDistributorExecutorClient return client for sharddistributor executor
+func (h *Impl) GetShardDistributorExecutorClient() executorclient.Client {
+	return h.shardDistributorExecutorRawClient
+}
+
 func (h *Impl) GetRatelimiterAggregatorsClient() qrpc.Client {
 	return h.ratelimiterAggregatorClient
 }
@@ -624,6 +652,11 @@ func (h *Impl) GetClientBean() client.Bean {
 // GetMetadataManager return metadata manager
 func (h *Impl) GetDomainManager() persistence.DomainManager {
 	return h.persistenceBean.GetDomainManager()
+}
+
+// GetDomainAuditManager return domain audit manager
+func (h *Impl) GetDomainAuditManager() persistence.DomainAuditManager {
+	return h.persistenceBean.GetDomainAuditManager()
 }
 
 // GetTaskManager return task manager
@@ -691,6 +724,11 @@ func (h *Impl) GetIsolationGroupStore() configstore.Client {
 // GetAsyncWorkflowQueueProvider returns the async workflow queue provider
 func (h *Impl) GetAsyncWorkflowQueueProvider() queue.Provider {
 	return h.asyncWorkflowQueueProvider
+}
+
+// GetMetricsScope returns the tally scope for metrics reporting
+func (h *Impl) GetMetricsScope() tally.Scope {
+	return h.metricsScope
 }
 
 // due to the config store being only available for some

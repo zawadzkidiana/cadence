@@ -13,17 +13,16 @@ import (
 	clientv3 "go.etcd.io/etcd/client/v3"
 	"gopkg.in/yaml.v2"
 
-	"github.com/uber/cadence/common/config"
-	shardDistributorCfg "github.com/uber/cadence/service/sharddistributor/config"
-	"github.com/uber/cadence/service/sharddistributor/store/etcd/etcdkeys"
+	"github.com/uber/cadence/service/sharddistributor/config"
 	"github.com/uber/cadence/testflags"
 )
 
 type StoreTestCluster struct {
-	EtcdPrefix string
-	Namespace  string
-	LeaderCfg  shardDistributorCfg.ShardDistribution
-	Client     *clientv3.Client
+	EtcdPrefix  string
+	Namespace   string
+	LeaderCfg   config.ShardDistribution
+	Client      *clientv3.Client
+	Compression string
 }
 
 func SetupStoreTestCluster(t *testing.T) *StoreTestCluster {
@@ -45,6 +44,7 @@ func SetupStoreTestCluster(t *testing.T) *StoreTestCluster {
 		"dialTimeout": "5s",
 		"prefix":      etcdPrefix,
 		"electionTTL": "5s", // Needed for leader config part
+		"compression": "snappy",
 	}
 
 	yamlCfg, err := yaml.Marshal(etcdConfigRaw)
@@ -53,17 +53,16 @@ func SetupStoreTestCluster(t *testing.T) *StoreTestCluster {
 	err = yaml.Unmarshal(yamlCfg, &yamlNode)
 	require.NoError(t, err)
 
-	leaderCfg := shardDistributorCfg.ShardDistribution{
-		Enabled:     true,
-		Store:       shardDistributorCfg.Store{StorageParams: yamlNode},
-		LeaderStore: shardDistributorCfg.Store{StorageParams: yamlNode},
+	leaderCfg := config.ShardDistribution{
+		Store:       config.Store{StorageParams: yamlNode},
+		LeaderStore: config.Store{StorageParams: yamlNode},
 	}
 
 	client, err := clientv3.New(clientv3.Config{Endpoints: endpoints, DialTimeout: 5 * time.Second})
 	require.NoError(t, err)
 	t.Cleanup(func() { client.Close() })
 
-	_, err = client.Delete(context.Background(), etcdkeys.BuildNamespacePrefix(etcdPrefix, namespace), clientv3.WithPrefix())
+	_, err = client.Delete(context.Background(), etcdPrefix, clientv3.WithPrefix())
 	require.NoError(t, err)
 
 	return &StoreTestCluster{

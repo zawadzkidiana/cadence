@@ -10,7 +10,7 @@ import (
 
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/types"
-	"github.com/uber/cadence/service/sharddistributor/executorclient"
+	"github.com/uber/cadence/service/sharddistributor/client/executorclient"
 )
 
 // This is a small shard processor, the only thing it currently does it
@@ -59,10 +59,11 @@ func (p *ShardProcessor) GetShardReport() executorclient.ShardReport {
 }
 
 // Start implements executorclient.ShardProcessor.
-func (p *ShardProcessor) Start(ctx context.Context) {
+func (p *ShardProcessor) Start(_ context.Context) error {
 	p.logger.Info("Starting shard processor", zap.String("shardID", p.shardID))
 	p.goRoutineWg.Add(1)
-	go p.process(ctx)
+	go p.process()
+	return nil
 }
 
 // Stop implements executorclient.ShardProcessor.
@@ -71,7 +72,7 @@ func (p *ShardProcessor) Stop() {
 	p.goRoutineWg.Wait()
 }
 
-func (p *ShardProcessor) process(ctx context.Context) {
+func (p *ShardProcessor) process() {
 	defer p.goRoutineWg.Done()
 
 	ticker := p.timeSource.NewTicker(processInterval)
@@ -82,8 +83,6 @@ func (p *ShardProcessor) process(ctx context.Context) {
 
 	for {
 		select {
-		case <-ctx.Done():
-			return
 		case <-p.stopChan:
 			p.logger.Info("Stopping shard processor", zap.String("shardID", p.shardID), zap.Int("steps", p.processSteps), zap.String("status", p.status.String()))
 			return

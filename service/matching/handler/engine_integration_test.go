@@ -40,11 +40,13 @@ import (
 	"go.uber.org/yarpc"
 
 	"github.com/uber/cadence/client/history"
+	"github.com/uber/cadence/client/matching"
 	"github.com/uber/cadence/common"
 	"github.com/uber/cadence/common/activecluster"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/cluster"
+	commonConfig "github.com/uber/cadence/common/config"
 	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/isolationgroup"
@@ -60,16 +62,22 @@ import (
 	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/service/matching/config"
 	"github.com/uber/cadence/service/matching/tasklist"
+	"github.com/uber/cadence/service/sharddistributor/client/clientcommon"
+	"github.com/uber/cadence/service/sharddistributor/client/executorclient"
+	sdconfig "github.com/uber/cadence/service/sharddistributor/config"
 )
 
 type (
 	matchingEngineSuite struct {
 		suite.Suite
-		controller             *gomock.Controller
-		mockHistoryClient      *history.MockClient
-		mockDomainCache        *cache.MockDomainCache
-		mockMembershipResolver *membership.MockResolver
-		mockIsolationStore     *dynamicconfig.MockClient
+		controller                     *gomock.Controller
+		mockHistoryClient              *history.MockClient
+		mockMatchingClient             *matching.MockClient
+		mockDomainCache                *cache.MockDomainCache
+		mockMembershipResolver         *membership.MockResolver
+		mockIsolationStore             *dynamicconfig.MockClient
+		mockShardExecutorClient        *executorclient.MockClient
+		ShardDistributorMatchingConfig clientcommon.Config
 
 		matchingEngine       *matchingEngineImpl
 		taskManager          *tasklist.TestTaskManager
@@ -125,6 +133,7 @@ func (s *matchingEngineSuite) SetupTest() {
 	s.mockExecutionManager = &mocks.ExecutionManager{}
 	s.controller = gomock.NewController(s.T())
 	s.mockHistoryClient = history.NewMockClient(s.controller)
+	s.mockMatchingClient = matching.NewMockClient(s.controller)
 	s.mockTimeSource = clock.NewMockedTimeSourceAt(time.Now())
 	s.taskManager = tasklist.NewTestTaskManager(s.T(), s.logger, s.mockTimeSource)
 	s.mockDomainCache = cache.NewMockDomainCache(s.controller)
@@ -174,14 +183,17 @@ func (s *matchingEngineSuite) newMatchingEngine(
 		taskMgr,
 		cluster.GetTestClusterMetadata(true),
 		s.mockHistoryClient,
-		nil,
+		s.mockMatchingClient,
 		config,
 		s.logger,
 		metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
+		tally.NoopScope,
 		s.mockDomainCache,
 		s.mockMembershipResolver,
 		s.isolationState,
 		s.mockTimeSource,
+		s.mockShardExecutorClient,
+		defaultSDExecutorConfig(),
 	).(*matchingEngineImpl)
 }
 
@@ -214,30 +226,31 @@ func (s *matchingEngineSuite) TestOnlyUnloadMatchingInstance() {
 		"makeToast",
 		persistence.TaskListTypeActivity)
 	tlKind := types.TaskListKindNormal
-	tlm, err := s.matchingEngine.getTaskListManager(taskListID, tlKind)
+	tlm, err := s.matchingEngine.getOrCreateTaskListManager(context.Background(), taskListID, tlKind)
 	s.Require().NoError(err)
-
-	tlm2, err := tasklist.NewManager(
-		s.matchingEngine.domainCache,
-		s.matchingEngine.logger,
-		s.matchingEngine.metricsClient,
-		s.matchingEngine.taskManager,
-		s.matchingEngine.clusterMetadata,
-		s.matchingEngine.isolationState,
-		s.matchingEngine.matchingClient,
-		s.matchingEngine.removeTaskListManager,
-		taskListID, // same taskListID as above
-		tlKind,
-		s.matchingEngine.config,
-		s.matchingEngine.timeSource,
-		s.matchingEngine.timeSource.Now(),
-		s.matchingEngine.historyService)
+	params := tasklist.ManagerParams{
+		DomainCache:     s.matchingEngine.domainCache,
+		Logger:          s.matchingEngine.logger,
+		MetricsClient:   s.matchingEngine.metricsClient,
+		TaskManager:     s.matchingEngine.taskManager,
+		ClusterMetadata: s.matchingEngine.clusterMetadata,
+		IsolationState:  s.matchingEngine.isolationState,
+		MatchingClient:  s.matchingEngine.matchingClient,
+		Registry:        s.matchingEngine, // Engine implements ManagerRegistry
+		TaskList:        taskListID,       // same taskListID as above
+		TaskListKind:    tlKind,
+		Cfg:             s.matchingEngine.config,
+		TimeSource:      s.matchingEngine.timeSource,
+		CreateTime:      s.matchingEngine.timeSource.Now(),
+		HistoryService:  s.matchingEngine.historyService,
+	}
+	tlm2, err := tasklist.NewManager(params)
 	s.Require().NoError(err)
 
 	// try to unload a different tlm instance with the same taskListID
 	s.matchingEngine.unloadTaskList(tlm2)
 
-	got, err := s.matchingEngine.getTaskListManager(taskListID, tlKind)
+	got, err := s.matchingEngine.getOrCreateTaskListManager(context.Background(), taskListID, tlKind)
 	s.Require().NoError(err)
 	s.Require().Same(tlm, got,
 		"Unload call with non-matching taskListManager should not cause unload")
@@ -245,7 +258,7 @@ func (s *matchingEngineSuite) TestOnlyUnloadMatchingInstance() {
 	// this time unload the right tlm
 	s.matchingEngine.unloadTaskList(tlm)
 
-	got, err = s.matchingEngine.getTaskListManager(taskListID, tlKind)
+	got, err = s.matchingEngine.getOrCreateTaskListManager(context.Background(), taskListID, tlKind)
 	s.Require().NoError(err)
 	s.Require().NotSame(tlm, got,
 		"Unload call with matching incarnation should have caused unload")
@@ -918,7 +931,7 @@ func (s *matchingEngineSuite) ConcurrentAddAndPollTasks(taskType int, workerCoun
 	expectedRange := getExpectedRange(initialRangeID, persisted, rangeSize)
 	// Due to conflicts some ids are skipped and more real ranges are used.
 	s.True(expectedRange <= s.taskManager.GetRangeID(testParam.TaskListID))
-	mgr, err := s.matchingEngine.getTaskListManager(testParam.TaskListID, tlKind)
+	mgr, err := s.matchingEngine.getOrCreateTaskListManager(context.Background(), testParam.TaskListID, tlKind)
 	s.NoError(err)
 	// stop the tasklist manager to force the acked tasks to be deleted
 	mgr.Stop()
@@ -1099,7 +1112,7 @@ func (s *matchingEngineSuite) TestAddTaskAfterStartFailure() {
 	s.NoError(err)
 	s.EqualValues(1, s.taskManager.GetTaskCount(tlID))
 
-	tlMgr, err := s.matchingEngine.getTaskListManager(tlID, tlKind)
+	tlMgr, err := s.matchingEngine.getOrCreateTaskListManager(context.Background(), tlID, tlKind)
 	s.NoError(err)
 	ctx, err := tlMgr.GetTask(context.Background(), nil)
 	s.NoError(err)
@@ -1206,7 +1219,7 @@ func (s *matchingEngineSuite) DrainBacklogNoPollersIsolationGroup(taskType int) 
 	s.taskManager.SetRangeID(testParam.TaskListID, initialRangeID)
 	s.matchingEngine.config.RangeSize = rangeSize // override to low number for the test
 	s.matchingEngine.config.ReadRangeSize = dynamicproperties.GetIntPropertyFn(rangeSize / 2)
-	_, err := s.matchingEngine.getTaskListManager(testParam.TaskListID, testParam.TaskList.GetKind())
+	_, err := s.matchingEngine.getOrCreateTaskListManager(context.Background(), testParam.TaskListID, testParam.TaskList.GetKind())
 	s.NoError(err)
 	// advance the time a bit more than warmup time of new tasklist after the creation of tasklist manager, which is 1 minute
 	s.mockTimeSource.Advance(time.Minute)
@@ -1393,7 +1406,7 @@ func validateTimeRange(t time.Time, expectedDuration time.Duration) bool {
 }
 
 func defaultTestConfig() *config.Config {
-	config := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", getIsolationGroupsHelper)
+	config := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", commonConfig.RPC{}, getIsolationGroupsHelper)
 	config.LongPollExpirationInterval = dynamicproperties.GetDurationPropertyFnFilteredByTaskListInfo(100 * time.Millisecond)
 	config.MaxTaskDeleteBatchSize = dynamicproperties.GetIntPropertyFilteredByTaskListInfo(1)
 	config.ReadRangeSize = dynamicproperties.GetIntPropertyFn(50000)
@@ -1402,6 +1415,18 @@ func defaultTestConfig() *config.Config {
 	config.MaxTimeBetweenTaskDeletes = time.Duration(0)
 	config.EnableTasklistOwnershipGuard = func(opts ...dynamicproperties.FilterOption) bool { return true }
 	return config
+}
+
+func defaultSDExecutorConfig() clientcommon.Config {
+	return clientcommon.Config{
+		Namespaces: []clientcommon.NamespaceConfig{{
+			Namespace:         "cadence-matching",
+			HeartBeatInterval: 1 * time.Second,
+			MigrationMode:     sdconfig.MigrationModeLOCALPASSTHROUGH,
+			TTLShard:          5 * time.Minute,
+			TTLReport:         1 * time.Minute,
+		}},
+	}
 }
 
 func getExpectedRange(initialRangeID, taskCount, rangeSize int) int64 {

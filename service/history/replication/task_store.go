@@ -80,11 +80,14 @@ func NewTaskStore(
 	metricsClient metrics.Client,
 	logger log.Logger,
 	hydrator taskHydrator,
+	budgetManager cache.Manager,
+	shardID int,
 ) *TaskStore {
+	cacheName := fmt.Sprintf("replication-cache-%d", shardID)
 
 	clusters := map[string]cache.AckCache[*types.ReplicationTask]{}
 	for clusterName := range clusterMetadata.GetRemoteClusterInfo() {
-		clusters[clusterName] = cache.NewBoundedAckCache[*types.ReplicationTask](config.ReplicatorCacheCapacity, config.ReplicatorCacheMaxSize, logger)
+		clusters[clusterName] = cache.NewBoundedAckCache[*types.ReplicationTask](config.ReplicatorCacheCapacity, config.ReplicatorCacheMaxSize, logger, budgetManager, cacheName)
 	}
 
 	retryPolicy := backoff.NewExponentialRetryPolicy(100 * time.Millisecond)
@@ -129,8 +132,13 @@ func (m *TaskStore) Get(ctx context.Context, cluster string, info persistence.Ta
 	scope := m.scope.Tagged(metrics.SourceClusterTag(cluster))
 
 	scope.IncCounter(metrics.CacheRequests)
+	// Keep timer (backwards compatible), dual-emit exponential histogram for migration.
+	cacheLatencyStart := time.Now()
 	sw := scope.StartTimer(metrics.CacheLatency)
 	defer sw.Stop()
+	defer func() {
+		scope.ExponentialHistogram(metrics.ExponentialCacheLatency, time.Since(cacheLatencyStart))
+	}()
 
 	task := cacheForTargetCluster.Get(info.GetTaskID())
 

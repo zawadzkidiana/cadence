@@ -7,14 +7,18 @@ import (
 
 	clientv3 "go.etcd.io/etcd/client/v3"
 
+	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/log"
+	"github.com/uber/cadence/service/sharddistributor/store"
+	"github.com/uber/cadence/service/sharddistributor/store/etcd/etcdclient"
 )
 
 type NamespaceToShards map[string]*namespaceShardToExecutor
 type ShardToExecutorCache struct {
 	sync.RWMutex
 	namespaceToShards NamespaceToShards
-	client            *clientv3.Client
+	timeSource        clock.TimeSource
+	client            etcdclient.Client
 	stopC             chan struct{}
 	logger            log.Logger
 	prefix            string
@@ -23,11 +27,13 @@ type ShardToExecutorCache struct {
 
 func NewShardToExecutorCache(
 	prefix string,
-	client *clientv3.Client,
+	client etcdclient.Client,
 	logger log.Logger,
+	timeSource clock.TimeSource,
 ) *ShardToExecutorCache {
 	shardCache := &ShardToExecutorCache{
 		namespaceToShards: make(NamespaceToShards),
+		timeSource:        timeSource,
 		stopC:             make(chan struct{}),
 		logger:            logger,
 		prefix:            prefix,
@@ -45,12 +51,20 @@ func (s *ShardToExecutorCache) Stop() {
 	s.wg.Wait()
 }
 
-func (s *ShardToExecutorCache) GetShardOwner(ctx context.Context, namespace, shardID string) (string, error) {
+func (s *ShardToExecutorCache) GetShardOwner(ctx context.Context, namespace, shardID string) (*store.ShardOwner, error) {
 	namespaceShardToExecutor, err := s.getNamespaceShardToExecutor(namespace)
 	if err != nil {
-		return "", fmt.Errorf("get namespace shard to executor: %w", err)
+		return nil, fmt.Errorf("get namespace shard to executor: %w", err)
 	}
 	return namespaceShardToExecutor.GetShardOwner(ctx, shardID)
+}
+
+func (s *ShardToExecutorCache) GetExecutor(ctx context.Context, namespace, executorID string) (*store.ShardOwner, error) {
+	namespaceShardToExecutor, err := s.getNamespaceShardToExecutor(namespace)
+	if err != nil {
+		return nil, fmt.Errorf("get namespace shard to executor: %w", err)
+	}
+	return namespaceShardToExecutor.GetExecutor(ctx, executorID)
 }
 
 func (s *ShardToExecutorCache) GetExecutorModRevisionCmp(namespace string) ([]clientv3.Cmp, error) {
@@ -59,6 +73,16 @@ func (s *ShardToExecutorCache) GetExecutorModRevisionCmp(namespace string) ([]cl
 		return nil, fmt.Errorf("get namespace shard to executor: %w", err)
 	}
 	return namespaceShardToExecutor.GetExecutorModRevisionCmp()
+}
+
+func (s *ShardToExecutorCache) Subscribe(ctx context.Context, namespace string) (<-chan map[*store.ShardOwner][]string, func(), error) {
+	namespaceShardToExecutor, err := s.getNamespaceShardToExecutor(namespace)
+	if err != nil {
+		return nil, nil, fmt.Errorf("get namespace shard to executor: %w", err)
+	}
+
+	ch, unSub := namespaceShardToExecutor.Subscribe(ctx)
+	return ch, unSub, nil
 }
 
 func (s *ShardToExecutorCache) getNamespaceShardToExecutor(namespace string) (*namespaceShardToExecutor, error) {
@@ -73,7 +97,7 @@ func (s *ShardToExecutorCache) getNamespaceShardToExecutor(namespace string) (*n
 	s.Lock()
 	defer s.Unlock()
 
-	namespaceShardToExecutor, err := newNamespaceShardToExecutor(s.prefix, namespace, s.client, s.stopC, s.logger)
+	namespaceShardToExecutor, err := newNamespaceShardToExecutor(s.prefix, namespace, s.client, s.stopC, s.logger, s.timeSource)
 	if err != nil {
 		return nil, fmt.Errorf("new namespace shard to executor: %w", err)
 	}

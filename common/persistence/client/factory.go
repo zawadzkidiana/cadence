@@ -24,6 +24,7 @@ package client
 
 import (
 	"sync"
+	"time"
 
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/codec"
@@ -64,6 +65,8 @@ type (
 		NewHistoryManager() (p.HistoryManager, error)
 		// NewDomainManager returns a new metadata manager
 		NewDomainManager() (p.DomainManager, error)
+		// NewDomainAuditManager returns a new domain audit manager
+		NewDomainAuditManager() (p.DomainAuditManager, error)
 		// NewExecutionManager returns a new execution manager for a given shardID
 		NewExecutionManager(shardID int) (p.ExecutionManager, error)
 		// NewVisibilityManager returns a new visibility manager
@@ -86,6 +89,8 @@ type (
 		NewHistoryStore() (p.HistoryStore, error)
 		// NewDomainStore returns a new metadata store
 		NewDomainStore() (p.DomainStore, error)
+		// NewDomainAuditStore returns a new domain audit store
+		NewDomainAuditStore() (p.DomainAuditStore, error)
 		// NewExecutionStore returns an execution store for given shardID
 		NewExecutionStore(shardID int) (p.ExecutionStore, error)
 		// NewVisibilityStore returns a new visibility store,
@@ -101,6 +106,7 @@ type (
 	Datastore struct {
 		factory   DataStoreFactory
 		ratelimit quotas.Limiter
+		name      string
 	}
 	factoryImpl struct {
 		sync.RWMutex
@@ -110,6 +116,7 @@ type (
 		datastores    map[storeType]Datastore
 		clusterName   string
 		dc            *p.DynamicConfiguration
+		hostname      string
 	}
 
 	storeType int
@@ -151,6 +158,7 @@ func NewFactory(
 	metricsClient metrics.Client,
 	logger log.Logger,
 	dc *p.DynamicConfiguration,
+	hostname string,
 ) Factory {
 	factory := &factoryImpl{
 		config:        cfg,
@@ -158,6 +166,7 @@ func NewFactory(
 		logger:        logger,
 		clusterName:   clusterName,
 		dc:            dc,
+		hostname:      hostname,
 	}
 	limiters := buildRatelimiters(cfg, persistenceMaxQPS)
 	factory.init(clusterName, limiters)
@@ -173,13 +182,13 @@ func (f *factoryImpl) NewTaskManager() (p.TaskManager, error) {
 	}
 	result := p.NewTaskManager(store)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewTaskManager(result, errorRate, f.logger)
+		result = errorinjectors.NewTaskManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewTaskManager(result, ds.ratelimit)
+		result = ratelimited.NewTaskManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewTaskManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewTaskManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
 	return result, nil
 }
@@ -193,13 +202,13 @@ func (f *factoryImpl) NewShardManager() (p.ShardManager, error) {
 	}
 	result := p.NewShardManager(store, f.dc)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewShardManager(result, errorRate, f.logger)
+		result = errorinjectors.NewShardManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewShardManager(result, ds.ratelimit)
+		result = ratelimited.NewShardManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewShardManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewShardManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
 	return result, nil
 }
@@ -213,13 +222,13 @@ func (f *factoryImpl) NewHistoryManager() (p.HistoryManager, error) {
 	}
 	result := p.NewHistoryV2ManagerImpl(store, f.logger, p.NewPayloadSerializer(), codec.NewThriftRWEncoder(), f.config.TransactionSizeLimit)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewHistoryManager(result, errorRate, f.logger)
+		result = errorinjectors.NewHistoryManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewHistoryManager(result, ds.ratelimit)
+		result = ratelimited.NewHistoryManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewHistoryManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewHistoryManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
 	return result, nil
 }
@@ -235,14 +244,31 @@ func (f *factoryImpl) NewDomainManager() (p.DomainManager, error) {
 	}
 	result := p.NewDomainManagerImpl(store, f.logger, p.NewPayloadSerializer(), f.dc)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewDomainManager(result, errorRate, f.logger)
+		result = errorinjectors.NewDomainManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewDomainManager(result, ds.ratelimit)
+		result = ratelimited.NewDomainManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewDomainManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewDomainManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
+	return result, nil
+}
+
+// NewDomainAuditManager returns a new domain audit manager
+func (f *factoryImpl) NewDomainAuditManager() (p.DomainAuditManager, error) {
+	var err error
+	var store p.DomainAuditStore
+
+	ds := f.datastores[storeTypeMetadata]
+	store, err = ds.factory.NewDomainAuditStore()
+	if err != nil {
+		return nil, err
+	}
+	if store == nil {
+		return nil, nil
+	}
+	result := p.NewDomainAuditManagerImpl(store, f.logger, p.NewPayloadSerializer(), f.dc)
 	return result, nil
 }
 
@@ -255,13 +281,13 @@ func (f *factoryImpl) NewExecutionManager(shardID int) (p.ExecutionManager, erro
 	}
 	result := p.NewExecutionManagerImpl(store, f.logger, p.NewPayloadSerializer(), f.dc)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewExecutionManager(result, errorRate, f.logger)
+		result = errorinjectors.NewExecutionManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewExecutionManager(result, ds.ratelimit)
+		result = ratelimited.NewExecutionManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewExecutionManager(result, f.metricsClient, f.logger, f.config, f.dc.PersistenceSampleLoggingRate, f.dc.EnableShardIDMetrics)
+		result = metered.NewExecutionManager(result, f.metricsClient, f.logger, f.config, f.dc.PersistenceSampleLoggingRate, f.dc.EnableShardIDMetrics, f.hostname, ds.name)
 	}
 	return result, nil
 }
@@ -391,7 +417,7 @@ func newPinotVisibilityManager(
 	// wrap with rate limiter
 	if visibilityConfig.PersistenceMaxQPS != nil && visibilityConfig.PersistenceMaxQPS() != 0 {
 		pinotRateLimiter := quotas.NewDynamicRateLimiter(visibilityConfig.PersistenceMaxQPS.AsFloat64())
-		visibilityFromPinot = ratelimited.NewVisibilityManager(visibilityFromPinot, pinotRateLimiter)
+		visibilityFromPinot = ratelimited.NewVisibilityManager(visibilityFromPinot, pinotRateLimiter, metricsClient, "pinot")
 	}
 
 	if metricsClient != nil {
@@ -421,7 +447,7 @@ func newESVisibilityManager(
 	// wrap with rate limiter
 	if visibilityConfig.PersistenceMaxQPS != nil && visibilityConfig.PersistenceMaxQPS() != 0 {
 		esRateLimiter := quotas.NewDynamicRateLimiter(visibilityConfig.PersistenceMaxQPS.AsFloat64())
-		visibilityFromES = ratelimited.NewVisibilityManager(visibilityFromES, esRateLimiter)
+		visibilityFromES = ratelimited.NewVisibilityManager(visibilityFromES, esRateLimiter, metricsClient, "elasticsearch")
 	}
 	if metricsClient != nil {
 		// wrap with metrics
@@ -448,10 +474,10 @@ func (f *factoryImpl) newDBVisibilityManager(
 	}
 	result := p.NewVisibilityManagerImpl(store, f.logger, f.dc)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewVisibilityManager(result, errorRate, f.logger)
+		result = errorinjectors.NewVisibilityManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewVisibilityManager(result, ds.ratelimit)
+		result = ratelimited.NewVisibilityManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if visibilityConfig.EnableDBVisibilitySampling != nil && visibilityConfig.EnableDBVisibilitySampling() {
 		result = sampled.NewVisibilityManager(result, sampled.Params{
@@ -467,7 +493,7 @@ func (f *factoryImpl) newDBVisibilityManager(
 		})
 	}
 	if f.metricsClient != nil {
-		result = metered.NewVisibilityManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewVisibilityManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
 
 	return result, nil
@@ -481,13 +507,13 @@ func (f *factoryImpl) NewDomainReplicationQueueManager() (p.QueueManager, error)
 	}
 	result := p.NewQueueManager(store)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewQueueManager(result, errorRate, f.logger)
+		result = errorinjectors.NewQueueManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewQueueManager(result, ds.ratelimit)
+		result = ratelimited.NewQueueManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewQueueManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewQueueManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
 
 	return result, nil
@@ -501,13 +527,13 @@ func (f *factoryImpl) NewConfigStoreManager() (p.ConfigStoreManager, error) {
 	}
 	result := p.NewConfigStoreManagerImpl(store, f.logger)
 	if errorRate := f.config.ErrorInjectionRate(); errorRate != 0 {
-		result = errorinjectors.NewConfigStoreManager(result, errorRate, f.logger)
+		result = errorinjectors.NewConfigStoreManager(result, errorRate, f.logger, time.Now())
 	}
 	if ds.ratelimit != nil {
-		result = ratelimited.NewConfigStoreManager(result, ds.ratelimit)
+		result = ratelimited.NewConfigStoreManager(result, ds.ratelimit, f.metricsClient, ds.name)
 	}
 	if f.metricsClient != nil {
-		result = metered.NewConfigStoreManager(result, f.metricsClient, f.logger, f.config)
+		result = metered.NewConfigStoreManager(result, f.metricsClient, f.logger, f.config, f.hostname, ds.name)
 	}
 
 	return result, nil
@@ -525,7 +551,7 @@ func (f *factoryImpl) init(clusterName string, limiters map[string]quotas.Limite
 	if defaultCfg.Cassandra != nil {
 		f.logger.Warn("Cassandra config is deprecated, please use NoSQL with pluginName of cassandra.")
 	}
-	defaultDataStore := Datastore{ratelimit: limiters[f.config.DefaultStore]}
+	defaultDataStore := Datastore{ratelimit: limiters[f.config.DefaultStore], name: f.config.DefaultStore}
 	switch {
 	case defaultCfg.NoSQL != nil:
 		parser := f.getParser()
@@ -566,7 +592,7 @@ func (f *factoryImpl) init(clusterName string, limiters map[string]quotas.Limite
 	if visibilityCfg.Cassandra != nil {
 		f.logger.Warn("Cassandra config is deprecated, please use NoSQL with pluginName of cassandra.")
 	}
-	visibilityDataStore := Datastore{ratelimit: limiters[f.config.VisibilityStore]}
+	visibilityDataStore := Datastore{ratelimit: limiters[f.config.VisibilityStore], name: f.config.VisibilityStore}
 	switch {
 	case visibilityCfg.NoSQL != nil:
 		parser := f.getParser()

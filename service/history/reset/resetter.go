@@ -24,8 +24,10 @@ package reset
 
 import (
 	"context"
+	"time"
 
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/activecluster"
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/cluster"
 	"github.com/uber/cadence/common/collection"
@@ -61,13 +63,14 @@ type (
 	}
 
 	workflowResetterImpl struct {
-		shard             shard.Context
-		domainCache       cache.DomainCache
-		clusterMetadata   cluster.Metadata
-		historyV2Mgr      persistence.HistoryManager
-		executionCache    execution.Cache
-		newStateRebuilder nDCStateRebuilderProvider
-		logger            log.Logger
+		shard                shard.Context
+		domainCache          cache.DomainCache
+		clusterMetadata      cluster.Metadata
+		activeClusterManager activecluster.Manager
+		historyV2Mgr         persistence.HistoryManager
+		executionCache       execution.Cache
+		newStateRebuilder    nDCStateRebuilderProvider
+		logger               log.Logger
 	}
 
 	nDCStateRebuilderProvider func() execution.StateRebuilder
@@ -82,11 +85,12 @@ func NewWorkflowResetter(
 	logger log.Logger,
 ) WorkflowResetter {
 	return &workflowResetterImpl{
-		shard:           shard,
-		domainCache:     shard.GetDomainCache(),
-		clusterMetadata: shard.GetClusterMetadata(),
-		historyV2Mgr:    shard.GetHistoryManager(),
-		executionCache:  executionCache,
+		shard:                shard,
+		domainCache:          shard.GetDomainCache(),
+		clusterMetadata:      shard.GetClusterMetadata(),
+		activeClusterManager: shard.GetActiveClusterManager(),
+		historyV2Mgr:         shard.GetHistoryManager(),
+		executionCache:       executionCache,
 		newStateRebuilder: func() execution.StateRebuilder {
 			return execution.NewStateRebuilder(shard, logger)
 		},
@@ -110,12 +114,12 @@ func (r *workflowResetterImpl) ResetWorkflow(
 	additionalReapplyEvents []*types.HistoryEvent,
 	skipSignalReapply bool,
 ) (retError error) {
-
-	domainEntry, err := r.domainCache.GetDomainByID(domainID)
+	activeClusterSelectionPolicy := currentWorkflow.GetMutableState().GetExecutionInfo().ActiveClusterSelectionPolicy
+	activeClusterInfo, err := r.activeClusterManager.GetActiveClusterInfoByClusterAttribute(ctx, domainID, activeClusterSelectionPolicy.GetClusterAttribute())
 	if err != nil {
 		return err
 	}
-	resetWorkflowVersion := domainEntry.GetFailoverVersion()
+	resetWorkflowVersion := activeClusterInfo.FailoverVersion
 
 	currentMutableState := currentWorkflow.GetMutableState()
 	currentWorkflowTerminated := false
@@ -218,7 +222,7 @@ func (r *workflowResetterImpl) prepareResetWorkflow(
 		return nil, err
 	}
 
-	if err := r.failInflightActivity(resetMutableState, resetReason); err != nil {
+	if err := r.failInflightActivity(resetMutableState.GetExecutionInfo().StartTimestamp, resetMutableState, resetReason); err != nil {
 		return nil, err
 	}
 
@@ -378,6 +382,7 @@ func (r *workflowResetterImpl) replayResetWorkflow(
 }
 
 func (r *workflowResetterImpl) failInflightActivity(
+	now time.Time,
 	mutableState execution.MutableState,
 	terminateReason string,
 ) error {
@@ -386,6 +391,12 @@ func (r *workflowResetterImpl) failInflightActivity(
 		switch ai.StartedID {
 		case constants.EmptyEventID:
 			// activity not started, noop
+			// override the activity time now
+			ai.ScheduledTime = now
+			ai.TimerTaskStatus = execution.TimerTaskStatusNone
+			if err := mutableState.UpdateActivity(ai); err != nil {
+				return err
+			}
 		case constants.TransientEventID:
 			// activity is started (with retry policy)
 			// should not encounter this case when rebuilding mutable state

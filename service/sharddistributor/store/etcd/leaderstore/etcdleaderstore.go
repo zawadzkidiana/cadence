@@ -14,6 +14,12 @@ import (
 	"github.com/uber/cadence/service/sharddistributor/store"
 )
 
+const (
+	// defaultElectionTTL is the default time-to-live for an election session.
+	// If the leader does not renew its lease within this time, it will lose leadership.
+	defaultElectionTTL = 10 * time.Second
+)
+
 type LeaderStore struct {
 	client         *clientv3.Client
 	electionConfig etcdCfg
@@ -38,10 +44,6 @@ type StoreParams struct {
 
 // NewLeaderStore creates a new leaderstore backed by ETCD.
 func NewLeaderStore(p StoreParams) (store.Elector, error) {
-	if !p.Cfg.Enabled {
-		return nil, nil
-	}
-
 	var err error
 
 	var out etcdCfg
@@ -58,6 +60,10 @@ func NewLeaderStore(p StoreParams) (store.Elector, error) {
 		if err != nil {
 			return nil, err
 		}
+	}
+
+	if out.ElectionTTL == 0 {
+		out.ElectionTTL = defaultElectionTTL
 	}
 
 	p.Lifecycle.Append(fx.StopHook(etcdClient.Close))

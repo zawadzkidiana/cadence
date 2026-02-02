@@ -25,7 +25,8 @@ package config
 import (
 	"time"
 
-	"github.com/uber/cadence/common/config"
+	"gopkg.in/yaml.v2"
+
 	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/types"
@@ -34,12 +35,14 @@ import (
 type (
 	// Config represents configuration for shard manager service
 	Config struct {
-		PersistenceMaxQPS       dynamicproperties.IntPropertyFn
-		PersistenceGlobalMaxQPS dynamicproperties.IntPropertyFn
-		ThrottledLogRPS         dynamicproperties.IntPropertyFn
+		LoadBalancingMode dynamicproperties.StringPropertyFnWithNamespaceFilters
+		MigrationMode     dynamicproperties.StringPropertyFnWithNamespaceFilters
 
-		// hostname info
-		HostName string
+		LoadBalancingNaive LoadBalancingNaiveConfig
+	}
+
+	LoadBalancingNaiveConfig struct {
+		MaxDeviation dynamicproperties.Float64PropertyFnWithNamespaceFilters
 	}
 
 	StaticConfig struct {
@@ -49,7 +52,6 @@ type (
 
 	// ShardDistribution is a configuration for leader election running.
 	ShardDistribution struct {
-		Enabled     bool          `yaml:"enabled"`
 		LeaderStore Store         `yaml:"leaderStore"`
 		Election    Election      `yaml:"election"`
 		Namespaces  []Namespace   `yaml:"namespaces"`
@@ -59,7 +61,7 @@ type (
 
 	// Store is a generic container for any storage configuration that should be parsed by the implementation.
 	Store struct {
-		StorageParams *config.YamlNode `yaml:"storageParams"`
+		StorageParams *YamlNode `yaml:"storageParams"`
 	}
 
 	Namespace struct {
@@ -77,8 +79,24 @@ type (
 	}
 
 	LeaderProcess struct {
-		Period       time.Duration `yaml:"period"`
+		// Period is the maximum duration between shard rebalance operations
+		// Default: 1 second
+		Period time.Duration `yaml:"period"`
+
+		// Timeout is the maximum duration of a single shard rebalance operation
+		// Default: 1 second
+		Timeout time.Duration `yaml:"timeout"`
+
+		// HeartbeatTTL is the duration after which, if no heartbeat is received from an executor,
+		// the executor is considered stale and its shards are eligible for redistribution.
+		// Default: 10 seconds
 		HeartbeatTTL time.Duration `yaml:"heartbeatTTL"`
+	}
+
+	// YamlNode is a lazy-unmarshaler, because *yaml.Node only exists in gopkg.in/yaml.v3, not v2,
+	// and go.uber.org/config currently uses only v2.
+	YamlNode struct {
+		unmarshal func(out any) error
 	}
 )
 
@@ -95,7 +113,8 @@ const (
 	MigrationModeONBOARDED              = "onboarded"
 )
 
-var configMode = map[string]types.MigrationMode{
+// MigrationMode maps string migration mode values to types.MigrationMode
+var MigrationMode = map[string]types.MigrationMode{
 	MigrationModeINVALID:                types.MigrationModeINVALID,
 	MigrationModeLOCALPASSTHROUGH:       types.MigrationModeLOCALPASSTHROUGH,
 	MigrationModeLOCALPASSTHROUGHSHADOW: types.MigrationModeLOCALPASSTHROUGHSHADOW,
@@ -103,40 +122,72 @@ var configMode = map[string]types.MigrationMode{
 	MigrationModeONBOARDED:              types.MigrationModeONBOARDED,
 }
 
+// NewConfig returns a new instance of Config
+func NewConfig(dc *dynamicconfig.Collection) *Config {
+	return &Config{
+		LoadBalancingMode: dc.GetStringPropertyFilteredByNamespace(dynamicproperties.ShardDistributorLoadBalancingMode),
+		MigrationMode:     dc.GetStringPropertyFilteredByNamespace(dynamicproperties.ShardDistributorMigrationMode),
+
+		LoadBalancingNaive: LoadBalancingNaiveConfig{
+			MaxDeviation: dc.GetFloat64PropertyFilteredByNamespace(dynamicproperties.ShardDistributorLoadBalancingNaiveMaxDeviation),
+		},
+	}
+}
+
+// GetMigrationMode gets the migration mode for a given namespace
+// If the mode is not set, it defaults to MigrationModeINVALID
+func (c *Config) GetMigrationMode(namespace string) types.MigrationMode {
+	mode, ok := MigrationMode[c.MigrationMode(namespace)]
+	if !ok {
+		return MigrationMode[MigrationModeINVALID]
+	}
+	return mode
+}
+
+const (
+	LoadBalancingModeINVALID = "invalid"
+	LoadBalancingModeNAIVE   = "naive"
+	LoadBalancingModeGREEDY  = "greedy"
+)
+
+// LoadBalancingMode maps string migration mode values to types.LoadBalancingMode
+var LoadBalancingMode = map[string]types.LoadBalancingMode{
+	LoadBalancingModeINVALID: types.LoadBalancingModeINVALID,
+	LoadBalancingModeNAIVE:   types.LoadBalancingModeNAIVE,
+	LoadBalancingModeGREEDY:  types.LoadBalancingModeGREEDY,
+}
+
+// GetLoadBalancingMode gets the load balancing mode for a given namespace
+// If the mode is invalid, it returns types.LoadBalancingModeINVALID
+func (c *Config) GetLoadBalancingMode(namespace string) types.LoadBalancingMode {
+	mode, ok := LoadBalancingMode[c.LoadBalancingMode(namespace)]
+	if !ok {
+		return types.LoadBalancingModeINVALID
+	}
+
+	return mode
+}
+
 func (s *ShardDistribution) GetMigrationMode(namespace string) types.MigrationMode {
 	for _, ns := range s.Namespaces {
 		if ns.Name == namespace {
-			return configMode[ns.Mode]
+			return MigrationMode[ns.Mode]
 		}
 	}
 	// TODO in the dynamic configuration I will setup a default value
-	return configMode[MigrationModeONBOARDED]
+	return MigrationMode[MigrationModeONBOARDED]
 }
 
-// NewConfig returns new service config with default values
-func NewConfig(dc *dynamicconfig.Collection, hostName string) *Config {
-	return &Config{
-		PersistenceMaxQPS:       dc.GetIntProperty(dynamicproperties.ShardManagerPersistenceMaxQPS),
-		PersistenceGlobalMaxQPS: dc.GetIntProperty(dynamicproperties.ShardManagerPersistenceGlobalMaxQPS),
-		ThrottledLogRPS:         dc.GetIntProperty(dynamicproperties.ShardManagerThrottledLogRPS),
-		HostName:                hostName,
-	}
+var _ yaml.Unmarshaler = (*YamlNode)(nil)
+
+func (y *YamlNode) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	y.unmarshal = unmarshal
+	return nil
 }
 
-// GetShardDistributionFromExternal converts other configs to an internal one.
-func GetShardDistributionFromExternal(in config.ShardDistribution) ShardDistribution {
-
-	namespaces := make([]Namespace, 0, len(in.Namespaces))
-	for _, namespace := range in.Namespaces {
-		namespaces = append(namespaces, Namespace(namespace))
+func (y *YamlNode) Decode(out any) error {
+	if y == nil {
+		return nil
 	}
-
-	return ShardDistribution{
-		Enabled:     in.Enabled,
-		LeaderStore: Store(in.LeaderStore),
-		Store:       Store(in.Store),
-		Election:    Election(in.Election),
-		Namespaces:  namespaces,
-		Process:     LeaderProcess(in.Process),
-	}
+	return y.unmarshal(out)
 }

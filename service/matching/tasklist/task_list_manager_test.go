@@ -36,6 +36,7 @@ import (
 	"go.uber.org/goleak"
 	"go.uber.org/mock/gomock"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/time/rate"
 
 	"github.com/uber/cadence/client/history"
 	"github.com/uber/cadence/client/matching"
@@ -43,6 +44,7 @@ import (
 	"github.com/uber/cadence/common/cache"
 	"github.com/uber/cadence/common/clock"
 	"github.com/uber/cadence/common/cluster"
+	commonConfig "github.com/uber/cadence/common/config"
 	"github.com/uber/cadence/common/dynamicconfig"
 	"github.com/uber/cadence/common/dynamicconfig/dynamicproperties"
 	"github.com/uber/cadence/common/isolationgroup"
@@ -86,31 +88,33 @@ func setupMocksForTaskListManager(t *testing.T, taskListID *Identifier, taskList
 		dynamicClient:      dynamicClient,
 	}
 	deps.mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("domainName", nil).Times(1)
-	config := config.NewConfig(dynamicconfig.NewCollection(dynamicClient, logger), "hostname", getIsolationgroupsHelper)
+	config := config.NewConfig(dynamicconfig.NewCollection(dynamicClient, logger), "hostname", commonConfig.RPC{}, getIsolationgroupsHelper)
 	mockHistoryService := history.NewMockClient(ctrl)
-
-	tlm, err := NewManager(
-		deps.mockDomainCache,
-		logger,
-		metricsClient,
-		deps.mockTaskManager,
-		clusterMetadata,
-		deps.mockIsolationState,
-		deps.mockMatchingClient,
-		func(Manager) {},
-		taskListID,
-		taskListKind,
-		config,
-		deps.mockTimeSource,
-		deps.mockTimeSource.Now(),
-		mockHistoryService,
-	)
+	mockRegistry := NewMockManagerRegistry(ctrl)
+	mockRegistry.EXPECT().UnregisterManager(gomock.Any()).AnyTimes()
+	params := ManagerParams{
+		DomainCache:     deps.mockDomainCache,
+		Logger:          logger,
+		MetricsClient:   metricsClient,
+		TaskManager:     deps.mockTaskManager,
+		ClusterMetadata: clusterMetadata,
+		IsolationState:  deps.mockIsolationState,
+		MatchingClient:  deps.mockMatchingClient,
+		Registry:        mockRegistry,
+		TaskList:        taskListID,
+		TaskListKind:    taskListKind,
+		Cfg:             config,
+		TimeSource:      deps.mockTimeSource,
+		CreateTime:      deps.mockTimeSource.Now(),
+		HistoryService:  mockHistoryService,
+	}
+	tlm, err := NewManager(params)
 	require.NoError(t, err)
 	return tlm.(*taskListManagerImpl), deps
 }
 
 func defaultTestConfig() *config.Config {
-	config := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", getIsolationgroupsHelper)
+	config := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", commonConfig.RPC{}, getIsolationgroupsHelper)
 	config.LongPollExpirationInterval = dynamicproperties.GetDurationPropertyFnFilteredByTaskListInfo(100 * time.Millisecond)
 	config.MaxTaskDeleteBatchSize = dynamicproperties.GetIntPropertyFilteredByTaskListInfo(1)
 	config.AllIsolationGroups = getIsolationgroupsHelper
@@ -231,33 +235,70 @@ func createTestTaskListManagerWithConfig(t *testing.T, logger log.Logger, contro
 	mockDomainCache := cache.NewMockDomainCache(controller)
 	mockDomainCache.EXPECT().GetDomainByID(gomock.Any()).Return(cache.CreateDomainCacheEntry("domainName"), nil).AnyTimes()
 	mockDomainCache.EXPECT().GetDomainName(gomock.Any()).Return("domainName", nil).AnyTimes()
+	mockMatchingClient := matching.NewMockClient(controller)
+	mockMatchingClient.EXPECT().RefreshTaskListPartitionConfig(gomock.Any(), gomock.Any()).Return(nil, nil).AnyTimes()
 	mockHistoryService := history.NewMockClient(controller)
+	mockRegistry := NewMockManagerRegistry(controller)
+	mockRegistry.EXPECT().UnregisterManager(gomock.Any()).AnyTimes()
 	tl := "tl"
 	dID := "domain"
 	tlID, err := NewIdentifier(dID, tl, persistence.TaskListTypeActivity)
 	if err != nil {
 		panic(err)
 	}
-	tlMgr, err := NewManager(
-		mockDomainCache,
-		logger,
-		metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
-		tm,
-		cluster.GetTestClusterMetadata(true),
-		mockIsolationState,
-		nil,
-		func(Manager) {},
-		tlID,
-		types.TaskListKindNormal,
-		cfg,
-		timeSource,
-		timeSource.Now(),
-		mockHistoryService,
-	)
+	params := ManagerParams{
+		DomainCache:     mockDomainCache,
+		Logger:          logger,
+		MetricsClient:   metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
+		TaskManager:     tm,
+		ClusterMetadata: cluster.GetTestClusterMetadata(true),
+		IsolationState:  mockIsolationState,
+		MatchingClient:  mockMatchingClient,
+		Registry:        mockRegistry,
+		TaskList:        tlID,
+		TaskListKind:    types.TaskListKindNormal,
+		Cfg:             cfg,
+		TimeSource:      timeSource,
+		CreateTime:      timeSource.Now(),
+		HistoryService:  mockHistoryService,
+	}
+	tlMgr, err := NewManager(params)
 	if err != nil {
 		logger.Fatal("error when createTestTaskListManager", tag.Error(err))
 	}
 	return tlMgr.(*taskListManagerImpl)
+}
+
+func TestTaskListManagerRegistryNotification(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockRegistry := NewMockManagerRegistry(ctrl)
+
+	// Create a minimal task list manager for testing
+	taskListID := NewTestTaskListID(t, uuid.New(), "test-tasklist", 0)
+	tlm, deps := setupMocksForTaskListManager(t, taskListID, types.TaskListKindNormal)
+
+	// Set up expectations for Start/Stop
+	deps.mockTaskManager.EXPECT().LeaseTaskList(gomock.Any(), gomock.Any()).Return(&persistence.LeaseTaskListResponse{TaskListInfo: &persistence.TaskListInfo{}}, nil).AnyTimes()
+	deps.mockTaskManager.EXPECT().UpdateTaskList(gomock.Any(), gomock.Any()).Return(&persistence.UpdateTaskListResponse{}, nil).AnyTimes()
+
+	// Replace the registry with our mock
+	tlm.registry = mockRegistry
+
+	// Expect UnregisterManager to be called exactly once with the manager instance
+	mockRegistry.EXPECT().UnregisterManager(tlm).Times(1)
+
+	// Start the manager
+	err := tlm.Start(context.Background())
+	require.NoError(t, err)
+
+	// Stop should call UnregisterManager
+	tlm.Stop()
+	// Verify the manager stopped
+	require.Equal(t, int32(1), tlm.stopped)
+
+	// Second call should be a no-op
+	tlm.Stop()
+	require.Equal(t, int32(1), tlm.stopped)
 }
 
 func TestDescribeTaskList(t *testing.T) {
@@ -415,13 +456,13 @@ func TestDescribeTaskList(t *testing.T) {
 
 func TestCheckIdleTaskList(t *testing.T) {
 	defer goleak.VerifyNone(t)
-	cfg := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", getIsolationgroupsHelper)
+	cfg := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", commonConfig.RPC{}, getIsolationgroupsHelper)
 	cfg.IdleTasklistCheckInterval = dynamicproperties.GetDurationPropertyFnFilteredByTaskListInfo(10 * time.Millisecond)
 
 	t.Run("Idle task-list", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		tlm := createTestTaskListManagerWithConfig(t, testlogger.New(t), ctrl, cfg, clock.NewRealTimeSource())
-		require.NoError(t, tlm.Start())
+		require.NoError(t, tlm.Start(context.Background()))
 
 		require.EqualValues(t, 0, atomic.LoadInt32(&tlm.stopped), "idle check interval had not passed yet")
 		time.Sleep(20 * time.Millisecond)
@@ -431,7 +472,7 @@ func TestCheckIdleTaskList(t *testing.T) {
 	t.Run("Active poll-er", func(t *testing.T) {
 		ctrl := gomock.NewController(t)
 		tlm := createTestTaskListManagerWithConfig(t, testlogger.New(t), ctrl, cfg, clock.NewRealTimeSource())
-		require.NoError(t, tlm.Start())
+		require.NoError(t, tlm.Start(context.Background()))
 
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		_, _ = tlm.GetTask(ctx, nil)
@@ -464,7 +505,7 @@ func TestCheckIdleTaskList(t *testing.T) {
 
 		ctrl := gomock.NewController(t)
 		tlm := createTestTaskListManagerWithConfig(t, testlogger.New(t), ctrl, cfg, clock.NewRealTimeSource())
-		require.NoError(t, tlm.Start())
+		require.NoError(t, tlm.Start(context.Background()))
 
 		time.Sleep(8 * time.Millisecond)
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
@@ -486,11 +527,11 @@ func TestAddTaskStandby(t *testing.T) {
 	controller := gomock.NewController(t)
 	logger := testlogger.New(t)
 
-	cfg := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", getIsolationgroupsHelper)
+	cfg := config.NewConfig(dynamicconfig.NewNopCollection(), "some random hostname", commonConfig.RPC{}, getIsolationgroupsHelper)
 	cfg.IdleTasklistCheckInterval = dynamicproperties.GetDurationPropertyFnFilteredByTaskListInfo(10 * time.Millisecond)
 
 	tlm := createTestTaskListManagerWithConfig(t, logger, controller, cfg, clock.NewMockedTimeSource())
-	require.NoError(t, tlm.Start())
+	require.NoError(t, tlm.Start(context.Background()))
 
 	// stop taskWriter so that we can check if there's any call to it
 	// otherwise the task persist process is async and hard to test
@@ -839,7 +880,7 @@ func TestTaskWriterShutdown(t *testing.T) {
 	controller := gomock.NewController(t)
 	logger := testlogger.New(t)
 	tlm := createTestTaskListManager(t, logger, controller)
-	err := tlm.Start()
+	err := tlm.Start(context.Background())
 	assert.NoError(t, err)
 
 	// stop the task writer explicitly
@@ -883,25 +924,28 @@ func TestTaskListManagerGetTaskBatch(t *testing.T) {
 	cfg := defaultTestConfig()
 	cfg.RangeSize = rangeSize
 	cfg.ReadRangeSize = dynamicproperties.GetIntPropertyFn(rangeSize / 2)
-	tlMgr, err := NewManager(
-		mockDomainCache,
-		logger,
-		metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
-		tm,
-		cluster.GetTestClusterMetadata(true),
-		mockIsolationState,
-		nil,
-		func(Manager) {},
-		taskListID,
-		types.TaskListKindNormal,
-		cfg,
-		timeSource,
-		timeSource.Now(),
-		mockHistoryService,
-	)
+	mockRegistry := NewMockManagerRegistry(controller)
+	mockRegistry.EXPECT().UnregisterManager(gomock.Any()).AnyTimes()
+	params := ManagerParams{
+		DomainCache:     mockDomainCache,
+		Logger:          logger,
+		MetricsClient:   metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
+		TaskManager:     tm,
+		ClusterMetadata: cluster.GetTestClusterMetadata(true),
+		IsolationState:  mockIsolationState,
+		MatchingClient:  matching.NewMockClient(controller),
+		Registry:        mockRegistry,
+		TaskList:        taskListID,
+		TaskListKind:    types.TaskListKindNormal,
+		Cfg:             cfg,
+		TimeSource:      timeSource,
+		CreateTime:      timeSource.Now(),
+		HistoryService:  mockHistoryService,
+	}
+	tlMgr, err := NewManager(params)
 	assert.NoError(t, err)
 	tlm := tlMgr.(*taskListManagerImpl)
-	err = tlm.Start()
+	err = tlm.Start(context.Background())
 	assert.NoError(t, err)
 
 	// add taskCount tasks
@@ -954,25 +998,26 @@ func TestTaskListManagerGetTaskBatch(t *testing.T) {
 	tlm.taskAckManager.SetReadLevel(int64(expectedBufSize))
 
 	// complete rangeSize events
-	tlMgr, err = NewManager(
-		mockDomainCache,
-		logger,
-		metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
-		tm,
-		cluster.GetTestClusterMetadata(true),
-		mockIsolationState,
-		nil,
-		func(Manager) {},
-		taskListID,
-		types.TaskListKindNormal,
-		cfg,
-		timeSource,
-		timeSource.Now(),
-		mockHistoryService,
-	)
+	newParams := ManagerParams{
+		DomainCache:     mockDomainCache,
+		Logger:          logger,
+		MetricsClient:   metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
+		TaskManager:     tm,
+		ClusterMetadata: cluster.GetTestClusterMetadata(true),
+		IsolationState:  mockIsolationState,
+		MatchingClient:  matching.NewMockClient(controller),
+		Registry:        mockRegistry,
+		TaskList:        taskListID,
+		TaskListKind:    types.TaskListKindNormal,
+		Cfg:             cfg,
+		TimeSource:      timeSource,
+		CreateTime:      timeSource.Now(),
+		HistoryService:  mockHistoryService,
+	}
+	tlMgr, err = NewManager(newParams)
 	assert.NoError(t, err)
 	tlm = tlMgr.(*taskListManagerImpl)
-	err = tlm.Start()
+	err = tlm.Start(context.Background())
 	assert.NoError(t, err)
 	for i := int64(0); i < rangeSize; i++ {
 		task, err := tlm.GetTask(context.Background(), nil)
@@ -1013,22 +1058,25 @@ func TestTaskListReaderPumpAdvancesAckLevelAfterEmptyReads(t *testing.T) {
 	cfg.RangeSize = rangeSize
 	cfg.ReadRangeSize = dynamicproperties.GetIntPropertyFn(rangeSize / 2)
 
-	tlMgr, err := NewManager(
-		mockDomainCache,
-		logger,
-		metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
-		tm,
-		cluster.GetTestClusterMetadata(true),
-		mockIsolationState,
-		nil,
-		func(Manager) {},
-		taskListID,
-		types.TaskListKindNormal,
-		cfg,
-		timeSource,
-		timeSource.Now(),
-		mockHistoryService,
-	)
+	mockRegistry := NewMockManagerRegistry(controller)
+	mockRegistry.EXPECT().UnregisterManager(gomock.Any()).AnyTimes()
+	params := ManagerParams{
+		DomainCache:     mockDomainCache,
+		Logger:          logger,
+		MetricsClient:   metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
+		TaskManager:     tm,
+		ClusterMetadata: cluster.GetTestClusterMetadata(true),
+		IsolationState:  mockIsolationState,
+		MatchingClient:  matching.NewMockClient(controller),
+		Registry:        mockRegistry,
+		TaskList:        taskListID,
+		TaskListKind:    types.TaskListKindNormal,
+		Cfg:             cfg,
+		TimeSource:      timeSource,
+		CreateTime:      timeSource.Now(),
+		HistoryService:  mockHistoryService,
+	}
+	tlMgr, err := NewManager(params)
 	require.NoError(t, err)
 	tlm := tlMgr.(*taskListManagerImpl)
 
@@ -1037,7 +1085,7 @@ func TestTaskListReaderPumpAdvancesAckLevelAfterEmptyReads(t *testing.T) {
 		tlm.taskWriter.renewLeaseWithRetry()
 	}
 
-	err = tlm.Start() // this call will also renew lease
+	err = tlm.Start(context.Background()) // this call will also renew lease
 	require.NoError(t, err)
 	defer tlm.Stop()
 
@@ -1160,25 +1208,28 @@ func TestTaskExpiryAndCompletion(t *testing.T) {
 			// set idle timer check to a really small value to assert that we don't accidentally drop tasks while blocking
 			// on enqueuing a task to task buffer
 			cfg.IdleTasklistCheckInterval = dynamicproperties.GetDurationPropertyFnFilteredByTaskListInfo(20 * time.Millisecond)
-			tlMgr, err := NewManager(
-				mockDomainCache,
-				logger,
-				metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
-				tm,
-				cluster.GetTestClusterMetadata(true),
-				mockIsolationState,
-				nil,
-				func(Manager) {},
-				taskListID,
-				types.TaskListKindNormal,
-				cfg,
-				timeSource,
-				timeSource.Now(),
-				mockHistoryService,
-			)
+			mockRegistry := NewMockManagerRegistry(controller)
+			mockRegistry.EXPECT().UnregisterManager(gomock.Any()).AnyTimes()
+			params := ManagerParams{
+				DomainCache:     mockDomainCache,
+				Logger:          logger,
+				MetricsClient:   metrics.NewClient(tally.NoopScope, metrics.Matching, metrics.HistogramMigration{}),
+				TaskManager:     tm,
+				ClusterMetadata: cluster.GetTestClusterMetadata(true),
+				IsolationState:  mockIsolationState,
+				MatchingClient:  matching.NewMockClient(controller),
+				Registry:        mockRegistry,
+				TaskList:        taskListID,
+				TaskListKind:    types.TaskListKindNormal,
+				Cfg:             cfg,
+				TimeSource:      timeSource,
+				CreateTime:      timeSource.Now(),
+				HistoryService:  mockHistoryService,
+			}
+			tlMgr, err := NewManager(params)
 			assert.NoError(t, err)
 			tlm := tlMgr.(*taskListManagerImpl)
-			err = tlm.Start()
+			err = tlm.Start(context.Background())
 			assert.NoError(t, err)
 			for i := int64(0); i < taskCount; i++ {
 				scheduleID := i * 3
@@ -1246,7 +1297,7 @@ func TestTaskListManagerImpl_HasPollerAfter(t *testing.T) {
 			controller := gomock.NewController(t)
 			logger := testlogger.New(t)
 			tlm := createTestTaskListManager(t, logger, controller)
-			err := tlm.Start()
+			err := tlm.Start(context.Background())
 			assert.NoError(t, err)
 
 			if tc.prepareManager != nil {
@@ -1654,7 +1705,7 @@ func TestManagerStart_RootPartition(t *testing.T) {
 			WritePartitions: partitions(2),
 		},
 	}).Return(&types.MatchingRefreshTaskListPartitionConfigResponse{}, nil)
-	assert.NoError(t, tlm.Start())
+	assert.NoError(t, tlm.Start(context.Background()))
 	assert.Equal(t, &types.TaskListPartitionConfig{Version: 1, ReadPartitions: partitions(2), WritePartitions: partitions(2)}, tlm.TaskListPartitionConfig())
 	tlm.stopWG.Wait()
 }
@@ -1696,7 +1747,7 @@ func TestManagerStart_NonRootPartition(t *testing.T) {
 			RangeID:  0,
 		},
 	}, nil)
-	assert.NoError(t, tlm.Start())
+	assert.NoError(t, tlm.Start(context.Background()))
 	assert.Equal(t, &types.TaskListPartitionConfig{
 		Version:         1,
 		ReadPartitions:  partitions(3),
@@ -1904,4 +1955,68 @@ func persistencePartitions(num int) map[int]*persistence.TaskListPartition {
 		result[i] = &persistence.TaskListPartition{}
 	}
 	return result
+}
+
+func TestTaskListUsesOverrideRPS(t *testing.T) {
+	testCases := []struct {
+		name                 string
+		overrideRPS          float64
+		maxDispatchPerSecond *float64
+		expectedRPS          float64
+	}{
+		{
+			name:                 "Uses maxDispatchPerSecond when overrideRPS is zero",
+			overrideRPS:          0.0,
+			maxDispatchPerSecond: common.Float64Ptr(75.0),
+			expectedRPS:          75.0,
+		},
+		{
+			name:                 "Uses maxDispatchPerSecond when overrideRPS is negative",
+			overrideRPS:          -1.0,
+			maxDispatchPerSecond: common.Float64Ptr(60.0),
+			expectedRPS:          60.0,
+		},
+		{
+			name:                 "OverrideRPS takes precedence when higher than maxDispatchPerSecond",
+			overrideRPS:          200.0,
+			maxDispatchPerSecond: common.Float64Ptr(50.0),
+			expectedRPS:          200.0,
+		},
+		{
+			name:                 "OverrideRPS takes precedence when lower than maxDispatchPerSecond",
+			overrideRPS:          25.0,
+			maxDispatchPerSecond: common.Float64Ptr(100.0),
+			expectedRPS:          25.0,
+		},
+		{
+			name:                 "No maxDispatchPerSecond and no overrideRPS",
+			overrideRPS:          0.0,
+			maxDispatchPerSecond: nil,
+			expectedRPS:          100000.0,
+		},
+		{
+			name:                 "OverrideRPS only, with no maxDispatchPerSecond",
+			overrideRPS:          150.0,
+			maxDispatchPerSecond: nil,
+			expectedRPS:          150.0,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			controller := gomock.NewController(t)
+			logger := testlogger.New(t)
+
+			cfg := defaultTestConfig()
+			cfg.OverrideTaskListRPS = func(domain, taskList string, taskType int) float64 {
+				return tc.overrideRPS
+			}
+
+			tlm := createTestTaskListManagerWithConfig(t, logger, controller, cfg, clock.NewMockedTimeSource())
+
+			_, _ = tlm.GetTask(context.Background(), tc.maxDispatchPerSecond)
+
+			assert.Equal(t, rate.Limit(tc.expectedRPS), tlm.limiter.Limit())
+		})
+	}
 }

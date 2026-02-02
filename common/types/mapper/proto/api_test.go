@@ -28,6 +28,7 @@ import (
 	apiv1 "github.com/uber/cadence-idl/go/proto/api/v1"
 
 	"github.com/uber/cadence/common"
+	"github.com/uber/cadence/common/testing/testdatagen"
 	"github.com/uber/cadence/common/types"
 	"github.com/uber/cadence/common/types/mapper/testutils"
 	"github.com/uber/cadence/common/types/testdata"
@@ -762,6 +763,83 @@ func TestUpdateDomainRequest(t *testing.T) {
 		assert.Equal(t, item, ToUpdateDomainRequest(FromUpdateDomainRequest(item)))
 	}
 }
+func TestFailoverDomainRequest(t *testing.T) {
+	// Test round-trip conversion for standard testdata
+	for _, item := range []*types.FailoverDomainRequest{nil, {}, &testdata.FailoverDomainRequest, &testdata.FailoverDomainRequest_OnlyActiveClusters} {
+		assert.Equal(t, item, ToFailoverDomainRequest(FromFailoverDomainRequest(item)))
+	}
+
+	// Test specific edge cases for proto3 empty string handling
+	t.Run("empty DomainActiveClusterName should map to nil pointer", func(t *testing.T) {
+		input := &apiv1.FailoverDomainRequest{
+			DomainName:              "test-domain",
+			DomainActiveClusterName: "",
+			ActiveClusters:          nil,
+		}
+		expected := &types.FailoverDomainRequest{
+			DomainName:              "test-domain",
+			DomainActiveClusterName: nil,
+			ActiveClusters:          nil,
+		}
+		result := ToFailoverDomainRequest(input)
+		assert.Equal(t, expected, result)
+		assert.Nil(t, result.DomainActiveClusterName,
+			"DomainActiveClusterName should be nil when proto field is empty string, not pointer to empty string")
+	})
+
+	t.Run("non-empty DomainActiveClusterName should map to pointer", func(t *testing.T) {
+		input := &apiv1.FailoverDomainRequest{
+			DomainName:              "test-domain",
+			DomainActiveClusterName: "cluster1",
+			ActiveClusters:          nil,
+		}
+		expected := &types.FailoverDomainRequest{
+			DomainName:              "test-domain",
+			DomainActiveClusterName: common.StringPtr("cluster1"),
+			ActiveClusters:          nil,
+		}
+		assert.Equal(t, expected, ToFailoverDomainRequest(input))
+	})
+
+	t.Run("with ActiveClusters and empty DomainActiveClusterName", func(t *testing.T) {
+		input := &apiv1.FailoverDomainRequest{
+			DomainName:              "test-domain",
+			DomainActiveClusterName: "",
+			ActiveClusters: &apiv1.ActiveClusters{
+				ActiveClustersByClusterAttribute: map[string]*apiv1.ClusterAttributeScope{
+					"location": {
+						ClusterAttributes: map[string]*apiv1.ActiveClusterInfo{
+							"london": {
+								ActiveClusterName: "cluster0",
+								FailoverVersion:   1,
+							},
+						},
+					},
+				},
+			},
+		}
+		expected := &types.FailoverDomainRequest{
+			DomainName:              "test-domain",
+			DomainActiveClusterName: nil,
+			ActiveClusters: &types.ActiveClusters{
+				AttributeScopes: map[string]types.ClusterAttributeScope{
+					"location": {
+						ClusterAttributes: map[string]types.ActiveClusterInfo{
+							"london": {
+								ActiveClusterName: "cluster0",
+								FailoverVersion:   1,
+							},
+						},
+					},
+				},
+			},
+		}
+		result := ToFailoverDomainRequest(input)
+		assert.Equal(t, expected, result)
+		assert.Nil(t, result.DomainActiveClusterName,
+			"DomainActiveClusterName should be nil when proto field is empty string")
+	})
+}
 func TestUpdateDomainResponse(t *testing.T) {
 	for _, item := range []*types.UpdateDomainResponse{nil, &testdata.UpdateDomainResponse} {
 		assert.Equal(t, item, ToUpdateDomainResponse(FromUpdateDomainResponse(item)))
@@ -1276,14 +1354,18 @@ func TestActiveClustersConversion(t *testing.T) {
 		nil,
 		{},
 		{
-			ActiveClustersByRegion: map[string]types.ActiveClusterInfo{
-				"us-west-1": {
-					ActiveClusterName: "cluster1",
-					FailoverVersion:   1,
-				},
-				"us-east-1": {
-					ActiveClusterName: "cluster2",
-					FailoverVersion:   2,
+			AttributeScopes: map[string]types.ClusterAttributeScope{
+				"region": {
+					ClusterAttributes: map[string]types.ActiveClusterInfo{
+						"us-west-1": {
+							ActiveClusterName: "cluster1",
+							FailoverVersion:   1,
+						},
+						"us-east-1": {
+							ActiveClusterName: "cluster2",
+							FailoverVersion:   2,
+						},
+					},
 				},
 			},
 		},
@@ -1312,12 +1394,6 @@ func TestActiveClustersConversion(t *testing.T) {
 			},
 		},
 		{
-			ActiveClustersByRegion: map[string]types.ActiveClusterInfo{
-				"us-west-1": {
-					ActiveClusterName: "cluster1",
-					FailoverVersion:   1,
-				},
-			},
 			AttributeScopes: map[string]types.ClusterAttributeScope{
 				"region": {
 					ClusterAttributes: map[string]types.ActiveClusterInfo{
@@ -1344,17 +1420,17 @@ func TestClusterAttribute(t *testing.T) {
 	}
 }
 
-// TODO(active-active): Remove the comment once the strategy is removed
-/*
 func TestActiveClusterSelectionPolicy(t *testing.T) {
 	for _, item := range []*types.ActiveClusterSelectionPolicy{
 		nil,
 		{},
 		&testdata.ActiveClusterSelectionPolicyWithClusterAttribute,
+		&testdata.ActiveClusterSelectionPolicyRegionSticky,
+		&testdata.ActiveClusterSelectionPolicyExternalEntity,
 	} {
 		assert.Equal(t, item, ToActiveClusterSelectionPolicy(FromActiveClusterSelectionPolicy(item)))
 	}
-}*/
+}
 
 func TestClusterAttributeScopeConversion(t *testing.T) {
 	testCases := []*types.ClusterAttributeScope{
@@ -1379,4 +1455,132 @@ func TestClusterAttributeScopeConversion(t *testing.T) {
 		roundTripObj := ToClusterAttributeScope(protoObj)
 		assert.Equal(t, original, roundTripObj)
 	}
+}
+
+func TestPaginationOptions(t *testing.T) {
+	for _, item := range []*types.PaginationOptions{nil, {}, &testdata.PaginationOptions} {
+		assert.Equal(t, item, ToPaginationOptions(FromPaginationOptions(item)))
+	}
+}
+
+func TestListFailoverHistoryRequestFilters(t *testing.T) {
+	for _, item := range []*types.ListFailoverHistoryRequestFilters{nil, {}, &testdata.ListFailoverHistoryRequestFilters} {
+		assert.Equal(t, item, ToListFailoverHistoryRequestFilters(FromListFailoverHistoryRequestFilters(item)))
+	}
+}
+
+func TestListFailoverHistoryRequest(t *testing.T) {
+	for _, item := range []*types.ListFailoverHistoryRequest{nil, {}, &testdata.ListFailoverHistoryRequest} {
+		assert.Equal(t, item, ToListFailoverHistoryRequest(FromListFailoverHistoryRequest(item)))
+	}
+}
+
+func TestListFailoverHistoryResponse(t *testing.T) {
+	for _, item := range []*types.ListFailoverHistoryResponse{nil, {}, &testdata.ListFailoverHistoryResponse} {
+		assert.Equal(t, item, ToListFailoverHistoryResponse(FromListFailoverHistoryResponse(item)))
+	}
+}
+
+func TestFailoverEvent(t *testing.T) {
+	for _, item := range []*types.FailoverEvent{nil, {}, &testdata.FailoverEvent} {
+		assert.Equal(t, item, ToFailoverEvent(FromFailoverEvent(item)))
+	}
+}
+
+func TestFailoverEventArray(t *testing.T) {
+	testCases := [][]*types.FailoverEvent{
+		nil,
+		{},
+		{nil},
+		{&testdata.FailoverEvent},
+		{&testdata.FailoverEvent, nil, &testdata.FailoverEvent},
+	}
+	for _, item := range testCases {
+		assert.Equal(t, item, ToFailoverEventArray(FromFailoverEventArray(item)))
+	}
+}
+
+func TestListFailoverHistoryResponseMapping(t *testing.T) {
+	fuzzer := testdatagen.New(t,
+		func(v *types.FailoverEvent, c fuzz.Continue) {
+			c.Fuzz(v)
+			// Don't allow empty strings for ID - use nil or a non-empty string
+			if v.ID != nil && *v.ID == "" {
+				v.ID = nil
+			}
+		})
+	for i := 0; i < 100; i++ {
+		var response types.ListFailoverHistoryResponse
+		fuzzer.Fuzz(&response)
+		protoResponse := FromListFailoverHistoryResponse(&response)
+		assert.Equal(t, &response, ToListFailoverHistoryResponse(protoResponse))
+	}
+}
+
+func TestClusterFailover(t *testing.T) {
+	for _, item := range []*types.ClusterFailover{nil, {}, &testdata.ClusterFailover} {
+		assert.Equal(t, item, ToClusterFailover(FromClusterFailover(item)))
+	}
+}
+
+func TestClusterFailoverArray(t *testing.T) {
+	testCases := [][]*types.ClusterFailover{
+		nil,
+		{},
+		{nil},
+		{&testdata.ClusterFailover},
+		{&testdata.ClusterFailover, nil, &testdata.ClusterFailover},
+	}
+	for _, item := range testCases {
+		assert.Equal(t, item, ToClusterFailoverArray(FromClusterFailoverArray(item)))
+	}
+}
+
+func TestActiveClusterInfo(t *testing.T) {
+	for _, item := range []*types.ActiveClusterInfo{nil, {}, &testdata.ActiveClusterInfo1, &testdata.ActiveClusterInfo2} {
+		assert.Equal(t, item, ToActiveClusterInfo(FromActiveClusterInfo(item)))
+	}
+}
+
+func TestFailoverType(t *testing.T) {
+	testCases := []struct {
+		name     string
+		input    *types.FailoverType
+		expected apiv1.FailoverType
+	}{
+		{
+			name:     "nil",
+			input:    nil,
+			expected: apiv1.FailoverType_FAILOVER_TYPE_INVALID,
+		},
+		{
+			name:     "force",
+			input:    types.FailoverTypeForce.Ptr(),
+			expected: apiv1.FailoverType_FAILOVER_TYPE_FORCE,
+		},
+		{
+			name:     "graceful",
+			input:    types.FailoverTypeGraceful.Ptr(),
+			expected: apiv1.FailoverType_FAILOVER_TYPE_GRACEFUL,
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := FromFailoverType(tc.input)
+			assert.Equal(t, tc.expected, result)
+
+			// Test round-trip
+			if tc.input != nil {
+				roundTrip := ToFailoverType(result)
+				assert.Equal(t, tc.input, roundTrip)
+			}
+		})
+	}
+
+	// Test ToFailoverType for all enum values
+	assert.Equal(t, types.FailoverTypeForce.Ptr(), ToFailoverType(apiv1.FailoverType_FAILOVER_TYPE_FORCE))
+	assert.Equal(t, types.FailoverTypeGraceful.Ptr(), ToFailoverType(apiv1.FailoverType_FAILOVER_TYPE_GRACEFUL))
+	assert.Nil(t, ToFailoverType(apiv1.FailoverType_FAILOVER_TYPE_INVALID))
+	assert.Nil(t, ToFailoverType(apiv1.FailoverType(999))) // Unknown value
 }
